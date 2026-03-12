@@ -1,49 +1,36 @@
-const BASE = '/api';
+const BASE = import.meta.env.VITE_API_URL || '';
 
-async function fetchJson(url, opts) {
-  const res = await fetch(`${BASE}${url}`, opts);
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
+async function fetchJson(path, opts = {}) {
+  const url = `${BASE}${path}`;
+  const res = await fetch(url, opts);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || `API error: ${res.status}`);
+  }
   return res.json();
 }
 
 export const api = {
-  getStats: () => fetchJson('/stats'),
-  getSources: () => fetchJson('/sources'),
-  getFeed: (page = 1) => fetchJson(`/feed?page=${page}`),
-  getAmplifiers: () => fetchJson('/amplifiers'),
-  getDefenders: () => fetchJson('/defenders'),
-  getTrends: (days = 7) => fetchJson(`/trends?days=${days}`),
-  getPresets: () => fetchJson('/presets'),
-  getDemoTexts: () => fetchJson('/demo/texts'),
-  analyze: (text, preset = 'neutro') =>
-    fetchJson('/analyze', {
+  getHealth: () => fetchJson('/api/health'),
+  getItems: (limit = 50, offset = 0) => fetchJson(`/api/items?limit=${limit}&offset=${offset}`),
+  getItem: (id) => fetchJson(`/api/items/${id}`),
+  getStatsOverview: () => fetchJson('/api/stats/overview'),
+  getStatsTrend: (days = 7) => fetchJson(`/api/stats/trend?days=${days}`),
+  getSources: () => fetchJson('/api/sources'),
+  addSource: (name, type, url) =>
+    fetchJson('/api/sources', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, preset })
+      body: JSON.stringify({ name, type, url }),
     }),
-  analyzeAllPresets: (text) =>
-    fetchJson('/analyze/preset', {
+  toggleSource: (id) =>
+    fetchJson(`/api/sources/${id}/toggle`, { method: 'PUT' }),
+  analyze: (text) =>
+    fetchJson('/api/analyze', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text })
+      body: JSON.stringify({ text }),
     }),
-  classifyDemo: () =>
-    fetchJson('/demo/classify', { method: 'POST' }),
-  submitContent: (text, { url, author, source, preset } = {}) =>
-    fetchJson('/submit', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, url, author, source, preset })
-    }),
-  exportPdf: () =>
-    fetch(`${BASE}/export/pdf`, { method: 'POST' })
-      .then(res => res.blob())
-      .then(blob => {
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = 'hodio-evidencia-manipulacion.pdf';
-        a.click();
-        URL.revokeObjectURL(url);
-      })
+  fetchRss: () =>
+    fetchJson('/api/fetch/rss', { method: 'POST' }),
 };

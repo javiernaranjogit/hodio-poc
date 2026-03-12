@@ -1,265 +1,137 @@
 import { Router } from 'express';
-import { classifyText, classifyWithAllPresets } from '../classifier.js';
-import { PRESETS, PRESET_NAMES, DEMO_TEXTS } from '../presets.js';
 import {
-  getGlobalStats, getSourceStats, getContentFeed,
-  getTopAmplifiers, getTopDefenders, getDailyScores,
-  cacheDemoScore, getDemoCached,
-  insertContent, insertPresetScore
+  getDb,
+  getContentCount,
+  getContentItems,
+  getContentItemById,
+  getStatsOverview,
+  getDailyStats,
+  getAllSources,
+  addSource,
+  toggleSource,
 } from '../db.js';
-import { generateManipulationPdf } from '../exportPdf.js';
-import { scrapeAll, getAvailableSources, scrapeHeadlines } from '../scrapers/index.js';
+import { processManualSubmission } from '../sources/manual.js';
+import { fetchAllRssSources } from '../sources/rss.js';
 
 const router = Router();
 
-// Global metrics
-router.get('/stats', (req, res) => {
+// GET /api/health
+router.get('/health', (req, res) => {
   try {
-    const stats = getGlobalStats();
-    res.json({
-      globalHateIndex: Math.round(stats.avg_score || 0),
-      totalContent: stats.total_content || 0,
-      highHateCount: stats.high_hate_count || 0,
-      counterHateCount: stats.counter_hate_count || 0
-    });
+    const db = getDb();
+    const items = getContentCount();
+    res.json({ status: 'ok', db: 'connected', items });
+  } catch (err) {
+    res.status(500).json({ status: 'error', db: 'error', items: 0 });
+  }
+});
+
+// GET /api/items?limit=50&offset=0
+router.get('/items', (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
+    const offset = parseInt(req.query.offset, 10) || 0;
+    const items = getContentItems(limit, offset);
+    res.json(items);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Per-source scores
+// GET /api/items/:id
+router.get('/items/:id', (req, res) => {
+  try {
+    const item = getContentItemById(parseInt(req.params.id, 10));
+    if (!item) return res.status(404).json({ error: 'Not found' });
+    res.json(item);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/stats/overview
+router.get('/stats/overview', (req, res) => {
+  try {
+    res.json(getStatsOverview());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/stats/trend?days=7
+router.get('/stats/trend', (req, res) => {
+  try {
+    const days = parseInt(req.query.days, 10) || 7;
+    res.json(getDailyStats(days));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sources
 router.get('/sources', (req, res) => {
   try {
-    const sources = getSourceStats();
-    res.json(sources);
+    res.json(getAllSources());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Paginated feed
-router.get('/feed', (req, res) => {
+// POST /api/sources
+router.post('/sources', (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const feed = getContentFeed(page);
-    res.json(feed);
+    const { name, type, url } = req.body;
+    if (!name || !type) return res.status(400).json({ error: 'name and type required' });
+    if (!['rss', 'scraper', 'twitter', 'manual'].includes(type)) {
+      return res.status(400).json({ error: 'Invalid type' });
+    }
+    if ((type === 'rss' || type === 'scraper') && !url) {
+      return res.status(400).json({ error: 'url required for rss/scraper' });
+    }
+    const result = addSource(name, type, url || null);
+    res.status(201).json({ id: result.lastInsertRowid, name, type, url: url || null });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Leaderboards
-router.get('/amplifiers', (req, res) => {
+// PUT /api/sources/:id/toggle
+router.put('/sources/:id/toggle', (req, res) => {
   try {
-    res.json(getTopAmplifiers());
+    const id = parseInt(req.params.id, 10);
+    const newActive = toggleSource(id);
+    if (newActive === null) return res.status(404).json({ error: 'Source not found' });
+    res.json({ id, active: newActive });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-router.get('/defenders', (req, res) => {
-  try {
-    res.json(getTopDefenders());
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Trends
-router.get('/trends', (req, res) => {
-  try {
-    const days = parseInt(req.query.days) || 7;
-    res.json(getDailyScores(days));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Analyze arbitrary text
+// POST /api/analyze
 router.post('/analyze', async (req, res) => {
   try {
-    const { text, preset = 'neutro' } = req.body;
-    if (!text) return res.status(400).json({ error: 'Text required' });
-    const result = await classifyText(text, preset);
+    const { text } = req.body;
+    if (!text || typeof text !== 'string') {
+      return res.status(400).json({ error: 'text required' });
+    }
+    if (text.trim().length < 50) {
+      return res.status(400).json({ error: 'Mínimo 50 caracteres' });
+    }
+    const result = await processManualSubmission(text);
+    if (result.duplicate) {
+      return res.status(409).json({ error: 'Texto duplicado', duplicate: true });
+    }
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Analyze text with specific preset, returns all 5 scores
-router.post('/analyze/preset', async (req, res) => {
+// POST /api/fetch/rss
+router.post('/fetch/rss', async (req, res) => {
   try {
-    const { text } = req.body;
-    if (!text) return res.status(400).json({ error: 'Text required' });
-    const results = await classifyWithAllPresets(text);
-    res.json(results);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// List presets
-router.get('/presets', (req, res) => {
-  const presets = {};
-  for (const [key, val] of Object.entries(PRESETS)) {
-    presets[key] = {
-      name: val.name,
-      emoji: val.emoji,
-      color: val.color,
-      description: val.description,
-      systemPrompt: val.systemPrompt
-    };
-  }
-  res.json(presets);
-});
-
-// Demo texts with all preset scores
-router.get('/demo/texts', async (req, res) => {
-  try {
-    const texts = DEMO_TEXTS.map(dt => {
-      const scores = {};
-      for (const presetName of PRESET_NAMES) {
-        const cached = getDemoCached(dt.id, presetName);
-        if (cached) {
-          scores[presetName] = { score: cached.score, category: cached.category, reasoning: cached.reasoning };
-        } else {
-          scores[presetName] = dt.expectedScores[presetName];
-        }
-      }
-      return { id: dt.id, text: dt.text, scores };
-    });
-    res.json(texts);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Classify demo texts with Claude (if API available) and cache
-router.post('/demo/classify', async (req, res) => {
-  try {
-    const results = [];
-    for (const dt of DEMO_TEXTS) {
-      const textResults = { id: dt.id, text: dt.text, scores: {} };
-      for (const presetName of PRESET_NAMES) {
-        const result = await classifyText(dt.text, presetName);
-        cacheDemoScore(dt.id, presetName, result.score, result.category, result.reasoning);
-        textResults.scores[presetName] = result;
-      }
-      results.push(textResults);
-    }
-    res.json(results);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Live scrape — fetch from all sources or specific ones
-router.get('/scrape', async (req, res) => {
-  try {
-    const sources = req.query.sources ? req.query.sources.split(',') : null;
-    const items = await scrapeAll(sources);
-    res.json({
-      count: items.length,
-      sources: [...new Set(items.map(h => h.source))],
-      items
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Scrape + classify + store — full pipeline
-router.post('/scrape/analyze', async (req, res) => {
-  try {
-    const { sources: sourceFilter, preset = 'neutro', limit = 30 } = req.body;
-    const items = await scrapeAll(sourceFilter);
-    const toAnalyze = items.slice(0, limit);
-
-    const results = [];
-    for (const item of toAnalyze) {
-      const classification = await classifyText(item.text, preset);
-
-      const inserted = insertContent({
-        source: item.source,
-        text: item.text,
-        author: item.author,
-        url: item.url,
-        timestamp: item.timestamp,
-        hate_score: classification.score,
-        category: classification.category,
-        targets: classification.targets,
-        preset_used: preset,
-        confidence: classification.confidence
-      });
-
-      insertPresetScore(inserted.lastInsertRowid, preset, classification.score, classification.category);
-
-      results.push({
-        ...item,
-        classification
-      });
-    }
-
-    res.json({
-      analyzed: results.length,
-      totalScraped: items.length,
-      results
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Submit manual content (tweet, post, etc.) — classify + store
-router.post('/submit', async (req, res) => {
-  try {
-    const { text, url, author, source = 'x_twitter', preset = 'neutro' } = req.body;
-    if (!text || text.trim().length < 5) {
-      return res.status(400).json({ error: 'Texto demasiado corto (mínimo 5 caracteres)' });
-    }
-
-    const classification = await classifyText(text.trim(), preset);
-
-    const inserted = insertContent({
-      source,
-      text: text.trim(),
-      author: author || 'manual',
-      url: url || '',
-      timestamp: new Date().toISOString(),
-      hate_score: classification.score,
-      category: classification.category,
-      targets: classification.targets,
-      preset_used: preset,
-      confidence: classification.confidence
-    });
-
-    insertPresetScore(inserted.lastInsertRowid, preset, classification.score, classification.category);
-
-    res.json({
-      id: inserted.lastInsertRowid,
-      text: text.trim(),
-      source,
-      author: author || 'manual',
-      url: url || '',
-      classification
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// List all available platforms/sources
-router.get('/platforms', (req, res) => {
-  res.json(getAvailableSources());
-});
-
-// PDF export
-router.post('/export/pdf', (req, res) => {
-  try {
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', 'attachment; filename=hodio-evidencia-manipulacion.pdf');
-    generateManipulationPdf(res);
+    const count = await fetchAllRssSources();
+    res.json({ fetched: count });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

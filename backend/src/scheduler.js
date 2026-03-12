@@ -1,64 +1,67 @@
 import cron from 'node-cron';
-import { scrapeAll } from './scrapers/index.js';
-import { classifyText, preFilter } from './classifier.js';
-import { insertContent, insertPresetScore, insertDailyScore, getDb } from './db.js';
-
-const MAX_API_CALLS_PER_RUN = 10;
+import { fetchAllRssSources } from './sources/rss.js';
+import { getDb, upsertDailyStat } from './db.js';
 
 export function startScheduler() {
+  // RSS fetch every 30 minutes
   cron.schedule('*/30 * * * *', async () => {
-    console.log('[Scheduler] Iniciando recolección de datos...');
-    await collectAndClassify();
+    try {
+      console.log('[Scheduler] RSS fetch...');
+      const count = await fetchAllRssSources();
+      console.log(`[Scheduler] RSS: ${count} new items`);
+    } catch (err) {
+      console.error('[Scheduler] RSS error:', err.message);
+    }
   });
 
-  console.log('[Scheduler] Programado: cada 30 minutos');
-}
-
-export async function collectAndClassify() {
-  let apiCallsUsed = 0;
-
-  try {
-    // Scrape all available sources (medios, google news, reddit, youtube, social)
-    const allContent = await scrapeAll();
-    console.log(`[Scheduler] Recolectados ${allContent.length} items`);
-
-    for (const item of allContent) {
-      const needsApi = preFilter(item.text) && apiCallsUsed < MAX_API_CALLS_PER_RUN;
-
-      const result = await classifyText(item.text, 'neutro');
-      if (needsApi) apiCallsUsed++;
-
-      const inserted = insertContent({
-        ...item,
-        hate_score: result.score,
-        category: result.category,
-        targets: result.targets,
-        preset_used: 'neutro',
-        confidence: result.confidence
-      });
-
-      insertPresetScore(inserted.lastInsertRowid, 'neutro', result.score, result.category);
+  // Regenerate daily_stats every 60 minutes
+  cron.schedule('0 * * * *', async () => {
+    try {
+      console.log('[Scheduler] Regenerating daily stats...');
+      regenerateDailyStats();
+      console.log('[Scheduler] Daily stats done');
+    } catch (err) {
+      console.error('[Scheduler] Stats error:', err.message);
     }
+  });
 
-    updateDailyScores();
-    console.log(`[Scheduler] Completado. ${allContent.length} items, ${apiCallsUsed} API calls`);
-  } catch (err) {
-    console.error('[Scheduler] Error:', err.message);
-  }
+  // Run RSS fetch immediately on startup
+  (async () => {
+    try {
+      console.log('[Scheduler] Initial RSS fetch on startup...');
+      const count = await fetchAllRssSources();
+      console.log(`[Scheduler] Initial RSS: ${count} new items`);
+    } catch (err) {
+      console.error('[Scheduler] Initial RSS error:', err.message);
+    }
+  })();
+
+  console.log('[Scheduler] RSS: every 30 min | Stats: every 60 min');
 }
 
-function updateDailyScores() {
-  const today = new Date().toISOString().split('T')[0];
-  const sources = getDb().prepare(`
-    SELECT source, AVG(hate_score) as avg, COUNT(*) as cnt
-    FROM content
-    WHERE date(timestamp) = date('now')
-    GROUP BY source
+function regenerateDailyStats() {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT
+      date(fetched_at) as date,
+      source_name,
+      AVG(hate_score) as avg_score,
+      COUNT(*) as item_count,
+      SUM(CASE WHEN category = 'hate_speech' THEN 1 ELSE 0 END) as hate_count,
+      SUM(CASE WHEN category = 'polarization' THEN 1 ELSE 0 END) as polarization_count
+    FROM content_items
+    WHERE hate_score IS NOT NULL AND source_name IS NOT NULL
+    GROUP BY date(fetched_at), source_name
   `).all();
 
-  for (const s of sources) {
-    insertDailyScore(s.source, today, s.avg, s.cnt);
+  for (const r of rows) {
+    upsertDailyStat(
+      r.date,
+      r.source_name,
+      r.avg_score,
+      r.item_count,
+      r.hate_count || 0,
+      r.polarization_count || 0
+    );
   }
 }
-
-export default { startScheduler, collectAndClassify };

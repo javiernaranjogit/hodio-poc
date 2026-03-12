@@ -4,8 +4,7 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js",
-    "seed": "node src/seed.js"
+    "dev": "node --watch src/index.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.26.0",
@@ -16,6 +15,6 @@
     "dotenv": "^16.4.0",
     "express": "^4.21.0",
     "node-cron": "^3.0.3",
-    "pdfkit": "^0.15.0"
+    "rss-parser": "^3.13.0"
   }
 }
